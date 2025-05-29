@@ -1,0 +1,14 @@
+[package]
+name = "bsc-supra"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1.0", features = ["full"] }
+serde_json = "1.0"
+eth_trie = "0.5.0"
+alloy-rlp = "0.3.12"
+alloy = "1.0.9"
+alloy-rpc-types = "1.0.9"
+alloy-consensus = "1.0.9"
