@@ -2,7 +2,9 @@ use reqwest;
 use serde_json::{json, Value};
 use std::error::Error;
 mod receipt;
+mod trie;
 use receipt::TransactionReceipt;
+use trie::receipts_root_hash;
 
 #[derive(Debug)]
 pub enum ProofGeneratorError {
@@ -72,14 +74,16 @@ async fn get_block_by_number(block_number: &str) -> Result<Value, Box<dyn Error>
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Get block by number (example: block 0xEDA8CE)
-    // println!("Fetching block 50488734...");
-    // let block_data = get_block_by_number("0x33275ced").await?;
-    // println!("Block data: {}", serde_json::to_string_pretty(&block_data)?);
-
     // Get block receipts for block 0xEDA8CE
-    // println!("\nFetching block receipts for block 50488734...");
     let receipts = get_block_receipts("0x3275ced").await?;
     println!("Receipts: {}", serde_json::to_string_pretty(&receipts[0])?);
+
+    // Calculate and print the receipts trie root hash
+    let root = trie::calculate_receipts_root_simple(&receipts);
+    println!("Receipts trie root hash: 0x{:x}", root);
+
+    let root2 = receipts_root_hash(&receipts);
+    println!("Receipts trie root hash: 0x{:x}", root2);
+
     Ok(())
 }
