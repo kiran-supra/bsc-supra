@@ -4,7 +4,8 @@ use std::error::Error;
 mod receipt;
 mod trie;
 use receipt::TransactionReceipt;
-use trie::receipts_root_hash;
+use alloy_primitives::B256;
+// use trie::receipts_root_hash;
 
 #[derive(Debug)]
 pub enum ProofGeneratorError {
@@ -79,11 +80,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Receipts: {}", serde_json::to_string_pretty(&receipts[0])?);
 
     // Calculate and print the receipts trie root hash
-    let root = trie::calculate_receipts_root_simple(&receipts);
-    println!("Receipts trie root hash: 0x{:x}", root);
+    let proof = trie::build_receipt_proof(&receipts, 1)?;
+    println!("Receipts trie root hash: {:?}", proof.iter().map(|x| hex::encode(x)).collect::<Vec<_>>());
 
-    let root2 = receipts_root_hash(&receipts);
-    println!("Receipts trie root hash: 0x{:x}", root2);
-
+    // let root2 = receipts_root_hash(&receipts);
+    // println!("Receipts trie root hash: 0x{:x}", root2);
+    let res = trie::verify_trie_proof("0x2c8373c02de79c4fb6e5b297abec8f6d960fe21c71c5212d97f8327c6ba8e060".parse::<B256>().unwrap(), 1, proof)?;
+    println!("Result: {:?}", rlp::decode::<TransactionReceipt>(&res));
     Ok(())
 }

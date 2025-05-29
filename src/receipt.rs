@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use rlp::{Encodable, RlpStream};
+use rlp::{Encodable, Decodable, RlpStream, Rlp};
 use ethereum_types::{H160, H256, Bloom};
 use hex;
 use std::str::FromStr;
@@ -38,6 +38,22 @@ impl Encodable for Log {
         // Convert hex string to bytes
         let data = hex::decode(&self.data[2..]).unwrap();
         s.append(&data);
+    }
+}
+
+impl Decodable for Log {
+    fn decode(rlp: &Rlp) -> Result<Self, rlp::DecoderError> {
+        Ok(Log {
+            address: format!("0x{}", hex::encode(rlp.val_at::<H160>(0)?)),
+            topics: rlp.list_at::<H256>(1)?.iter().map(|t| format!("0x{}", hex::encode(t))).collect(),
+            data: format!("0x{}", hex::encode(rlp.val_at::<Vec<u8>>(2)?)),
+            block_hash: "0x0".to_string(),
+            block_number: "0x0".to_string(),
+            transaction_hash: "0x0".to_string(),
+            transaction_index: "0x0".to_string(),
+            log_index: "0x0".to_string(),
+            removed: false,
+        })
     }
 }
 
@@ -95,5 +111,26 @@ impl TransactionReceipt {
         let mut stream = RlpStream::new();
         self.rlp_append(&mut stream);
         stream.out().to_vec()
+    }
+}
+
+impl Decodable for TransactionReceipt {
+    fn decode(rlp: &Rlp) -> Result<Self, rlp::DecoderError> {
+        Ok(TransactionReceipt {
+            status: format!("0x{:x}", rlp.val_at::<u64>(0)?),
+            cumulative_gas_used: format!("0x{:x}", rlp.val_at::<u64>(1)?),
+            logs_bloom: format!("0x{}", hex::encode(rlp.val_at::<Bloom>(2)?)),
+            logs: rlp.list_at(3)?,
+            block_hash: "0x0".to_string(),
+            block_number: "0x0".to_string(),
+            contract_address: None,
+            effective_gas_price: "0x0".to_string(),
+            from: "0x0".to_string(),
+            gas_used: "0x0".to_string(),
+            to: "0x0".to_string(),
+            transaction_hash: "0x0".to_string(),
+            transaction_index: "0x0".to_string(),
+            transaction_type: "0x0".to_string(),
+        })
     }
 } 
