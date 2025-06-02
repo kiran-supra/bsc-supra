@@ -1,5 +1,5 @@
 use alloy::primitives::B256;
-use alloy_consensus::{Receipt, ReceiptWithBloom, TxReceipt, TxType};
+use alloy_consensus::{Receipt, ReceiptWithBloom, TxReceipt, TxType, Transaction};
 use alloy_rlp::encode;
 use alloy_rlp::{Buf, Decodable};
 use alloy_rpc_types::TransactionReceipt;
@@ -67,10 +67,11 @@ async fn get_block_by_number(block_number: &str) -> Result<Value, Box<dyn Error>
 
     let request_body = json!({
         "method": "eth_getBlockByNumber",
-        "params": [block_number, false],
+        "params": [block_number, true],
         "id": 1,
         "jsonrpc": "2.0"
     });
+    
 
     let response = client
         .post("https://bsc-testnet-rpc.publicnode.com/") // Use same RPC for consistency
@@ -239,6 +240,14 @@ pub fn verify_trie_proof(
 // Helper function to get receipt root from block
 pub async fn get_receipt_root(block_number: &str) -> Result<B256, Box<dyn Error>> {
     let block_data = get_block_by_number(block_number).await?;
+    
+    // Write block data to JSON file
+    let file_name = format!("block_{}.json", block_number);
+    std::fs::write(
+        &file_name,
+        serde_json::to_string_pretty(&block_data)?,
+    )?;
+    println!("Block data written to {}", file_name);
 
     let receipt_root_str = block_data["result"]["receiptsRoot"]
         .as_str()
@@ -341,89 +350,136 @@ pub fn get_logs_from_receipt(receipt: &[u8]) -> Result<ExtractedLogs, ProofGener
     Ok(logs)
 }
 
+pub fn encode_bsc_transaction(tx: &Value) -> Result<Vec<u8>, ProofGeneratorError> {
+    // Helper function to decode hex with proper padding
+    fn decode_hex(hex: &str) -> Result<Vec<u8>, ProofGeneratorError> {
+        let hex = hex.strip_prefix("0x").unwrap_or(hex);
+        // Pad with leading zero if odd length
+        let hex = if hex.len() % 2 != 0 {
+            format!("0{}", hex)
+        } else {
+            hex.to_string()
+        };
+        hex::decode(&hex)
+            .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode hex: {}", e)))
+    }
+
+    // Get transaction type
+    let tx_type = tx["type"].as_str().unwrap_or("0x0");
+    let tx_type_num = u8::from_str_radix(tx_type.strip_prefix("0x").unwrap_or(tx_type), 16)
+        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to parse transaction type: {}", e)))?;
+
+    // Common fields for all transaction types
+    let nonce = decode_hex(tx["nonce"].as_str().unwrap_or("0x0"))?;
+    let gas = decode_hex(tx["gas"].as_str().unwrap_or("0x0"))?;
+    let to = decode_hex(tx["to"].as_str().unwrap_or("0x0"))?;
+    let value = decode_hex(tx["value"].as_str().unwrap_or("0x0"))?;
+    let input = decode_hex(tx["input"].as_str().unwrap_or("0x"))?;
+    let v = decode_hex(tx["v"].as_str().unwrap_or("0x0"))?;
+    let r = decode_hex(tx["r"].as_str().unwrap_or("0x0"))?;
+    let s = decode_hex(tx["s"].as_str().unwrap_or("0x0"))?;
+
+    // Create transaction list based on type
+    let mut tx_list = Vec::new();
+    
+    match tx_type_num {
+        0 => {
+            // Legacy transaction
+            let gas_price = decode_hex(tx["gasPrice"].as_str().unwrap_or("0x0"))?;
+            tx_list.push(nonce);
+            tx_list.push(gas_price);
+            tx_list.push(gas);
+            tx_list.push(to);
+            tx_list.push(value);
+            tx_list.push(input);
+            tx_list.push(v);
+            tx_list.push(r);
+            tx_list.push(s);
+        }
+        2 => {
+            // EIP-1559 transaction
+            let max_priority_fee = decode_hex(tx["maxPriorityFeePerGas"].as_str().unwrap_or("0x0"))?;
+            let max_fee = decode_hex(tx["maxFeePerGas"].as_str().unwrap_or("0x0"))?;
+            
+            // Create and encode empty access list
+            let access_list: Vec<Vec<u8>> = Vec::new();
+            let encoded_access_list = alloy_rlp::encode(&access_list);
+            
+            tx_list.push(nonce);
+            tx_list.push(max_priority_fee);
+            tx_list.push(max_fee);
+            tx_list.push(gas);
+            tx_list.push(to);
+            tx_list.push(value);
+            tx_list.push(input);
+            tx_list.push(encoded_access_list);
+            tx_list.push(v);
+            tx_list.push(r);
+            tx_list.push(s);
+        }
+        _ => return Err(ProofGeneratorError::EncodingError(format!("Unsupported transaction type: {}", tx_type_num))),
+    }
+
+    // Encode transaction
+    let encoded = alloy_rlp::encode(&tx_list);
+
+    // Add type prefix if not legacy transaction
+    let final_encoded = if tx_type_num == 0 {
+        encoded
+    } else {
+        [vec![tx_type_num], encoded].concat()
+    };
+
+    Ok(final_encoded)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let block_number = "0x3275CED";
     let tx_hash =
-        B256::from_str("0x89d7d9e273b05b7e301918f59a9ffe6d2c78560cdec2a785b64d28c960dd6e16")?;
+        B256::from_str("0xfb24129e36ced650e37b9a4ac02c3eb5dfe91131f9b4f6e085c52544731995d5")?;
 
-    println!("Fetching block receipts for block {}...", block_number);
-    let receipts = get_block_receipts(block_number).await?;
-    println!("Found {} receipts", receipts.len());
+    // Get block data
+    println!("Fetching block data...");
+    let block_data = get_block_by_number(block_number).await?;
+    
+    // Get transactions from block
+    let transactions = block_data["result"]["transactions"].as_array()
+        .ok_or("No transactions found in block")?;
+    println!("Found {} transactions in block", transactions.len());
 
-    // Get the actual receipt root from the block
-    println!("\nFetching receipt root from block...");
-    let block_receipt_root = get_receipt_root(block_number).await?;
-    println!("Receipt root from block header: {}", block_receipt_root);
+    // Build transaction trie
+    println!("\nBuilding transaction trie...");
+    let memdb = Arc::new(MemoryDB::new(true));
+    let mut trie = EthTrie::new(Arc::clone(&memdb));
 
-    // Generate proof and get our constructed root
-    println!("\nGenerating receipt proof...");
-    let (proof, constructed_root) = print_receipt_proof(&receipts, &tx_hash).await?;
-
-    println!("proof {:?}", proof);
-
-    // Compare roots
-    println!("\nRoot comparison:");
-    println!("Block header root:   {}", block_receipt_root);
-    println!("Constructed root:    {}", constructed_root);
-
-    // Get transaction index
-    let tx_index = get_tx_index(&receipts, &tx_hash)?;
-    println!("\nTransaction index: {}", tx_index);
-
-    // Try verification with both roots
-    println!("\n=== Verification with block header root ===");
-    match verify_trie_proof(block_receipt_root, tx_index, proof.clone()) {
-        Ok(verified_data) => {
-            println!("Verification successful with block header root!");
-            println!("Verified data length: {} bytes", verified_data.len());
-
-            // Compare with original receipt encoding
-            let decoded = get_logs_from_receipt(&verified_data)?;
-            println!("Decoded logs: {:?}", decoded);
-            // println!("address {:?}",decoded.g
-            let extracted_log = decoded.0.get(0 as usize).unwrap();
-            println!("address {:?}", extracted_log.address.as_slice());
-            let original_encoded = encode_receipt(&receipts[tx_index as usize])?;
-            println!("Original receipt length: {} bytes", original_encoded.len());
-            println!("Data matches: {}", verified_data == original_encoded);
-        }
-        Err(e) => {
-            println!("Verification failed with block header root: {}", e);
-        }
+    for (i, tx) in transactions.iter().enumerate() {
+        // Use simple byte array for the key (transaction index)
+        let key = vec![i as u8];
+        let value = encode_bsc_transaction(tx)?;
+        
+        println!(
+            "Inserting transaction {} (encoded key: {:?}) with value length: {}",
+            i,
+            key,
+            value.len()
+        );
+        
+        trie.insert(key.as_slice(), value.as_slice()).map_err(|e| {
+            ProofGeneratorError::TrieError(format!("Failed to insert into trie: {:?}", e))
+        })?;
     }
 
-    // println!("\n=== Verification with constructed root ===");
-    // match verify_trie_proof(constructed_root, tx_index, proof.clone()) {
-    //     Ok(verified_data) => {
-    //         println!(" Verification successful with constructed root!");
-    //         println!("Verified data length: {} bytes", verified_data.len());
-
-    //         // Compare with original receipt encoding
-    //         let original_encoded = encode_receipt(&receipts[tx_index as usize])?;
-    //         println!("Original receipt length: {} bytes", original_encoded.len());
-    //         println!("Data matches: {}", verified_data == original_encoded);
-    //         // println!("Result: {:?}", alloy_rlp::decode::<TransactionReceipt>(&verified_data));
-    //     }
-    //     Err(e) => {
-    //         println!(" Verification failed with constructed root: {}", e);
-    //     }
-    // }
-
-    // If roots don't match, there might be an issue with receipt encoding
-    // if block_receipt_root != constructed_root {
-
-    //     for (i, receipt) in receipts.iter().take(3).enumerate() {
-    //         println!("\nReceipt {}:", i);
-    //         println!("  Transaction hash: {}", receipt.transaction_hash);
-    //         println!("  Gas used: {}", receipt.gas_used);
-
-    //         match encode_receipt(receipt) {
-    //             Ok(encoded) => println!("  Encoded length: {} bytes", encoded.len()),
-    //             Err(e) => println!("  Encoding error: {}", e),
-    //         }
-    //     }
-    // }
+    // Get the root hash
+    let root = trie
+        .root_hash()
+        .map_err(|e| ProofGeneratorError::TrieError(format!("Failed to get root hash: {:?}", e)))?;
+    
+    let root_b256 = B256::from_slice(root.as_slice());
+    println!("\nTransaction trie root comparison:");
+    println!("Constructed root: {}", root_b256);
+    println!("Expected root:    0x801ab75552816c3669a6d26d8164c32cd7e542e61c25d0950c52c3d372e00c4e");
+    println!("Roots match: {}", root_b256 == B256::from_str("0x801ab75552816c3669a6d26d8164c32cd7e542e61c25d0950c52c3d372e00c4e")?);
 
     Ok(())
 }
