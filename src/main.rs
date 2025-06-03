@@ -98,7 +98,7 @@ impl Encodable for AccessList {
 
 async fn get_block_by_number(block_number: &str) -> Result<Value, Box<dyn Error>> {
     let client = reqwest::Client::new();
-
+    
     let request_body = json!({
         "method": "eth_getBlockByNumber",
         "params": [block_number, true],
@@ -107,13 +107,22 @@ async fn get_block_by_number(block_number: &str) -> Result<Value, Box<dyn Error>
     });
 
     let response = client
-        .post("https://bsc-testnet-rpc.publicnode.com/") // Use same RPC for consistency
+        .post("https://bsc-rpc.publicnode.com/") // Use same RPC for consistency
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
         .await?;
 
     let block_data: Value = response.json().await?;
+    
+    // Export block data to JSON file
+    let file_name = format!("block_{}.json", block_number);
+    std::fs::write(
+        &file_name,
+        serde_json::to_string_pretty(&block_data)?,
+    )?;
+    println!("Block data written to {}", file_name);
+    
     Ok(block_data)
 }
 
@@ -619,6 +628,74 @@ pub fn encode_bsc_transaction(tx: &Value) -> Result<Vec<u8>, ProofGeneratorError
 
             Ok(encode(&legacy_tx))
         }
+        1 => {
+            // Access List transaction encoding
+            let chain_id = get_u256_from_hex(tx["chainId"].as_str().unwrap_or("0x61"))?; // BSC testnet
+            let gas_price = get_u256_from_hex(tx["gasPrice"].as_str().unwrap_or("0x0"))?;
+
+            // Handle access list
+            let access_list = if let Some(al) = tx["accessList"].as_array() {
+                let mut items = Vec::new();
+                for item in al {
+                    let address = Address::from_str(item["address"].as_str().unwrap_or(""))
+                        .map_err(|e| {
+                            ProofGeneratorError::EncodingError(format!(
+                                "Access list address error: {}",
+                                e
+                            ))
+                        })?;
+
+                    let storage_keys: Result<Vec<U256>, _> = item["storageKeys"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .map(|key| get_u256_from_hex(key.as_str().unwrap_or("0x0")))
+                        .collect();
+
+                    items.push(AccessListItem {
+                        address,
+                        storage_keys: storage_keys?,
+                    });
+                }
+                AccessList(items)
+            } else {
+                AccessList(Vec::new())
+            };
+
+            #[derive(RlpEncodable)]
+            #[rlp(trailing)]
+            struct AccessListTransaction {
+                chain_id: U256,
+                nonce: U256,
+                gas_price: U256,
+                gas_limit: U256,
+                to: Option<Address>,
+                value: Option<U256>,
+                input: Option<Bytes>,
+                access_list: Option<AccessList>,
+                v: Option<U256>,
+                r: Option<U256>,
+                s: Option<U256>,
+            }
+
+            let access_list_tx = AccessListTransaction {
+                chain_id,
+                nonce,
+                gas_price,
+                gas_limit,
+                to,
+                value: Some(value),
+                input: Some(input),
+                access_list: Some(access_list),
+                v: Some(v),
+                r: Some(r),
+                s: Some(s),
+            };
+
+            let encoded = encode(&access_list_tx);
+            // Prepend transaction type for Access List
+            Ok([vec![tx_type_num], encoded].concat())
+        }
         2 => {
             // EIP-1559 transaction encoding
             let chain_id = get_u256_from_hex(tx["chainId"].as_str().unwrap_or("0x61"))?; // BSC testnet
@@ -740,6 +817,24 @@ impl DecodedTransaction {
                     json_obj["gasPrice"] = json!(format!("0x{:x}", gas_price));
                 }
             }
+            1 => {
+                // Access List transaction
+                if let Some(chain_id) = self.chain_id {
+                    json_obj["chainId"] = json!(format!("0x{:x}", chain_id));
+                }
+                if let Some(gas_price) = self.gas_price {
+                    json_obj["gasPrice"] = json!(format!("0x{:x}", gas_price));
+                }
+                if let Some(access_list) = &self.access_list {
+                    let al: Vec<Value> = access_list.iter().map(|(addr, keys)| {
+                        json!({
+                            "address": format!("0x{:x}", addr),
+                            "storageKeys": keys.iter().map(|k| format!("0x{:x}", k)).collect::<Vec<_>>()
+                        })
+                    }).collect();
+                    json_obj["accessList"] = json!(al);
+                }
+            }
             2 => {
                 // EIP-1559 transaction
                 if let Some(chain_id) = self.chain_id {
@@ -782,6 +877,7 @@ pub fn decode_bsc_transaction(encoded_data: &[u8]) -> Result<DecodedTransaction,
         let rlp_data = &encoded_data[1..];
         
         match tx_type {
+            // 1 => decode_access_list_transaction(rlp_data),
             2 => decode_eip1559_transaction(rlp_data),
             _ => Err(ProofGeneratorError::EncodingError(format!("Unsupported transaction type: {}", tx_type))),
         }
@@ -1007,7 +1103,7 @@ fn decode_access_list(buf: &mut &[u8]) -> Result<Vec<(Address, Vec<U256>)>, Proo
 // Updated main function with correct transaction trie building
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let block_number = "0x3275ced"; // Your block number
+    let block_number = "0x302659E"; // Your block number
 
     // Get block data with transactions
     let block_data = get_block_by_number(block_number).await?;
@@ -1055,14 +1151,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Expected root:    {}", expected_root);
     println!("Roots match: {}", constructed_root_b256 == expected_root);
 
-    let proof = trie.get_proof(&encode(0_u8)).unwrap();
+    let proof = trie.get_proof(&encode(123_u64)).unwrap();
     println!("proof {:?}", proof);
     let k = trie
-        .verify_proof(constructed_root, &encode(0_u8), proof)
+        .verify_proof(constructed_root, &encode(123_u64), proof)
         .unwrap();
     println!("k {:?}", k);
-    let k = decode_bsc_transaction(&k.unwrap()).unwrap();
-    println!("decode txn {:?}",k);
+    let decoded_tx = decode_bsc_transaction(&k.unwrap()).unwrap();
+    println!("decode txn {:?}", decoded_tx);
+    
+    // Print consensus addresses from the decoded transaction
+    print_consensus_addresses(&decoded_tx);
 
     Ok(())
+}
+
+fn extract_consensus_addresses(input: &[u8]) -> Result<Vec<Address>, ProofGeneratorError> {
+    // Check if input starts with the expected method ID
+    if input.len() < 4 || &input[0..4] != [0x1e, 0x4c, 0x15, 0x24] {
+        return Err(ProofGeneratorError::EncodingError("Invalid method ID".to_string()));
+    }
+
+    // Skip method ID and first 4 parameters (each 32 bytes)
+    let mut offset = 4 + (4 * 32);
+    
+    // Extract 45 addresses
+    let mut addresses = Vec::with_capacity(45);
+    for _ in 0..45 {
+        if offset + 32 > input.len() {
+            return Err(ProofGeneratorError::EncodingError("Input data too short".to_string()));
+        }
+        
+        // Each address is in the last 20 bytes of a 32-byte word
+        let addr_bytes = &input[offset + 12..offset + 32];
+        let address = Address::from_slice(addr_bytes);
+        addresses.push(address);
+        
+        offset += 32;
+    }
+
+    Ok(addresses)
+}
+
+// Add this to your main function or wherever you're processing transactions
+fn print_consensus_addresses(tx: &DecodedTransaction) {
+    if let Ok(addresses) = extract_consensus_addresses(&tx.input) {
+        println!("Found {} consensus addresses:", addresses.len());
+        for (i, addr) in addresses.iter().enumerate() {
+            println!("{}. 0x{}", i + 1, hex::encode(addr));
+        }
+    } else {
+        println!("Failed to extract consensus addresses");
+    }
 }
