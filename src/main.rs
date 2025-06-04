@@ -107,7 +107,7 @@ async fn get_block_by_number(block_number: &str) -> Result<Value, Box<dyn Error>
     });
 
     let response = client
-        .post("https://bsc-testnet-rpc.publicnode.com/") // Use same RPC for consistency
+        .post("https://bsc-rpc.publicnode.com/") // Use same RPC for consistency
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
@@ -1007,7 +1007,7 @@ fn decode_access_list(buf: &mut &[u8]) -> Result<Vec<(Address, Vec<U256>)>, Proo
 // Updated main function with correct transaction trie building
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let block_number = "0x3275ced"; // Your block number
+    let block_number = "0x302659E"; // Your block number
 
     // Get block data with transactions
     let block_data = get_block_by_number(block_number).await?;
