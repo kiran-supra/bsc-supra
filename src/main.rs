@@ -67,10 +67,10 @@ use std::{error::Error, str::FromStr, sync::Arc};
 
 use alloy_primitives::B256;
 use alloy_primitives::{Address, Bytes, U256};
+use alloy_rlp::{Buf, Decodable};
 use alloy_rlp::{BufMut, Encodable, RlpEncodable, encode};
 use eth_trie::{EthTrie, MemoryDB, Trie};
 use serde_json::{Value, json};
-use alloy_rlp::{Decodable, Buf};
 
 #[derive(Debug)]
 struct AccessListItem {
@@ -619,6 +619,70 @@ pub fn encode_bsc_transaction(tx: &Value) -> Result<Vec<u8>, ProofGeneratorError
 
             Ok(encode(&legacy_tx))
         }
+        1 => {
+            // EIP-2930 Access List transaction encoding
+            let chain_id = get_u256_from_hex(tx["chainId"].as_str().unwrap_or("0x61"))?; // BSC testnet
+            println!("chain_id {:?}",chain_id);
+            let gas_price = get_u256_from_hex(tx["gasPrice"].as_str().unwrap_or("0x0"))?;
+            // Handle access list
+            let access_list = if let Some(al) = tx["accessList"].as_array() {
+                let mut items = Vec::new();
+                for item in al {
+                    let address = Address::from_str(item["address"].as_str().unwrap_or(""))
+                        .map_err(|e| {
+                            ProofGeneratorError::EncodingError(format!(
+                                "Access list address error: {}",
+                                e
+                            ))
+                        })?;
+                    let storage_keys: Result<Vec<U256>, _> = item["storageKeys"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .map(|key| get_u256_from_hex(key.as_str().unwrap_or("0x0")))
+                        .collect();
+                    items.push(AccessListItem {
+                        address,
+                        storage_keys: storage_keys?,
+                    });
+                }
+                AccessList(items)
+            } else {
+                AccessList(Vec::new())
+            };
+            // Use alloy_rlp's encoder directly
+            use alloy_rlp::Encodable;
+            let mut buf = Vec::new();
+            
+            // We need to calculate the payload length first
+            let mut temp_buf = Vec::new();
+            chain_id.encode(&mut temp_buf);
+            nonce.encode(&mut temp_buf);
+            gas_price.encode(&mut temp_buf);
+            gas_limit.encode(&mut temp_buf);
+            
+            // Handle the 'to' field - encode as empty bytes if None
+            if let Some(to_addr) = to {
+                to_addr.encode(&mut temp_buf);
+            } else {
+                // Empty byte string for contract creation - encode as empty Vec<u8>
+                let empty_bytes: Vec<u8> = Vec::new();
+                empty_bytes.encode(&mut temp_buf);
+            }
+            
+            value.encode(&mut temp_buf);
+            input.encode(&mut temp_buf);
+            access_list.encode(&mut temp_buf);
+            v.encode(&mut temp_buf);
+            r.encode(&mut temp_buf);
+            s.encode(&mut temp_buf);
+            
+            // Now encode with correct length
+            alloy_rlp::Header { list: true, payload_length: temp_buf.len() }.encode(&mut buf);
+            buf.extend_from_slice(&temp_buf);
+            // Prepend transaction type for EIP-2930
+            Ok([vec![tx_type_num], buf].concat())
+        }
         2 => {
             // EIP-1559 transaction encoding
             let chain_id = get_u256_from_hex(tx["chainId"].as_str().unwrap_or("0x61"))?; // BSC testnet
@@ -698,7 +762,6 @@ pub fn encode_bsc_transaction(tx: &Value) -> Result<Vec<u8>, ProofGeneratorError
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct DecodedTransaction {
     pub tx_type: u8,
@@ -768,22 +831,29 @@ impl DecodedTransaction {
     }
 }
 
-pub fn decode_bsc_transaction(encoded_data: &[u8]) -> Result<DecodedTransaction, ProofGeneratorError> {
+pub fn decode_bsc_transaction(
+    encoded_data: &[u8],
+) -> Result<DecodedTransaction, ProofGeneratorError> {
     if encoded_data.is_empty() {
-        return Err(ProofGeneratorError::EncodingError("Empty transaction data".to_string()));
+        return Err(ProofGeneratorError::EncodingError(
+            "Empty transaction data".to_string(),
+        ));
     }
 
     // Check if it's a typed transaction (starts with transaction type)
     let first_byte = encoded_data[0];
-    
+
     if first_byte < 0x80 {
         // Typed transaction (EIP-2718)
         let tx_type = first_byte;
         let rlp_data = &encoded_data[1..];
-        
+
         match tx_type {
             2 => decode_eip1559_transaction(rlp_data),
-            _ => Err(ProofGeneratorError::EncodingError(format!("Unsupported transaction type: {}", tx_type))),
+            _ => Err(ProofGeneratorError::EncodingError(format!(
+                "Unsupported transaction type: {}",
+                tx_type
+            ))),
         }
     } else {
         // Legacy transaction (RLP encoded directly)
@@ -793,55 +863,65 @@ pub fn decode_bsc_transaction(encoded_data: &[u8]) -> Result<DecodedTransaction,
 
 fn decode_legacy_transaction(data: &[u8]) -> Result<DecodedTransaction, ProofGeneratorError> {
     let mut buf = data;
-    
+
     // Decode RLP list header
-    let header = alloy_rlp::Header::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode RLP header: {}", e)))?;
-    
+    let header = alloy_rlp::Header::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode RLP header: {}", e))
+    })?;
+
     if !header.list {
-        return Err(ProofGeneratorError::EncodingError("Expected RLP list for transaction".to_string()));
+        return Err(ProofGeneratorError::EncodingError(
+            "Expected RLP list for transaction".to_string(),
+        ));
     }
 
     // Decode fields in order: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
-    let nonce = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode nonce: {}", e)))?;
-    
-    let gas_price = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode gas price: {}", e)))?;
-    
-    let gas_limit = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode gas limit: {}", e)))?;
-    
+    let nonce = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode nonce: {}", e))
+    })?;
+
+    let gas_price = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode gas price: {}", e))
+    })?;
+
+    let gas_limit = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode gas limit: {}", e))
+    })?;
+
     // Decode 'to' field (can be empty for contract creation)
     let to = if buf.is_empty() {
         None
     } else {
         let mut temp_buf = buf;
-        let header = alloy_rlp::Header::decode(&mut temp_buf)
-            .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode address header: {}", e)))?;
-        
+        let header = alloy_rlp::Header::decode(&mut temp_buf).map_err(|e| {
+            ProofGeneratorError::EncodingError(format!("Failed to decode address header: {}", e))
+        })?;
+
         if header.payload_length == 0 {
             buf = temp_buf;
             None
         } else {
-            let addr = Address::decode(&mut buf)
-                .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode address: {}", e)))?;
+            let addr = Address::decode(&mut buf).map_err(|e| {
+                ProofGeneratorError::EncodingError(format!("Failed to decode address: {}", e))
+            })?;
             Some(addr)
         }
     };
-    
-    let value = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode value: {}", e)))?;
-    
-    let input = Bytes::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode input: {}", e)))?;
-    
+
+    let value = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode value: {}", e))
+    })?;
+
+    let input = Bytes::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode input: {}", e))
+    })?;
+
     let v = U256::decode(&mut buf)
         .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode v: {}", e)))?;
-    
+
     let r = U256::decode(&mut buf)
         .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode r: {}", e)))?;
-    
+
     let s = U256::decode(&mut buf)
         .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode s: {}", e)))?;
 
@@ -865,48 +945,58 @@ fn decode_legacy_transaction(data: &[u8]) -> Result<DecodedTransaction, ProofGen
 
 fn decode_eip1559_transaction(data: &[u8]) -> Result<DecodedTransaction, ProofGeneratorError> {
     let mut buf = data;
-    
+
     // Decode RLP list header
-    let header = alloy_rlp::Header::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode RLP header: {}", e)))?;
-    
+    let header = alloy_rlp::Header::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode RLP header: {}", e))
+    })?;
+
     if !header.list {
-        return Err(ProofGeneratorError::EncodingError("Expected RLP list for EIP-1559 transaction".to_string()));
+        return Err(ProofGeneratorError::EncodingError(
+            "Expected RLP list for EIP-1559 transaction".to_string(),
+        ));
     }
 
     // Decode fields: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, v, r, s]
-    let chain_id = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode chain ID: {}", e)))?;
-    
-    let nonce = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode nonce: {}", e)))?;
-    
-    let max_priority_fee_per_gas = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode max priority fee: {}", e)))?;
-    
-    let max_fee_per_gas = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode max fee: {}", e)))?;
-    
-    let gas_limit = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode gas limit: {}", e)))?;
-    
+    let chain_id = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode chain ID: {}", e))
+    })?;
+
+    let nonce = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode nonce: {}", e))
+    })?;
+
+    let max_priority_fee_per_gas = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode max priority fee: {}", e))
+    })?;
+
+    let max_fee_per_gas = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode max fee: {}", e))
+    })?;
+
+    let gas_limit = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode gas limit: {}", e))
+    })?;
+
     let to = decode_optional_address(&mut buf)?;
-    
-    let value = U256::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode value: {}", e)))?;
-    
-    let input = Bytes::decode(&mut buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode input: {}", e)))?;
-    
+
+    let value = U256::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode value: {}", e))
+    })?;
+
+    let input = Bytes::decode(&mut buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode input: {}", e))
+    })?;
+
     // Decode access list
     let access_list = decode_access_list(&mut buf)?;
-    
+
     let v = U256::decode(&mut buf)
         .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode v: {}", e)))?;
-    
+
     let r = U256::decode(&mut buf)
         .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode r: {}", e)))?;
-    
+
     let s = U256::decode(&mut buf)
         .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode s: {}", e)))?;
 
@@ -929,65 +1019,90 @@ fn decode_eip1559_transaction(data: &[u8]) -> Result<DecodedTransaction, ProofGe
 }
 
 fn decode_optional_address(buf: &mut &[u8]) -> Result<Option<Address>, ProofGeneratorError> {
-    let header = alloy_rlp::Header::decode(buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode address header: {}", e)))?;
-    
+    let header = alloy_rlp::Header::decode(buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode address header: {}", e))
+    })?;
+
     if header.payload_length == 0 {
         // Empty address (contract creation)
         Ok(None)
     } else if header.payload_length == 20 {
         // Valid address
-        let addr = Address::decode(buf)
-            .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode address: {}", e)))?;
+        let addr = Address::decode(buf).map_err(|e| {
+            ProofGeneratorError::EncodingError(format!("Failed to decode address: {}", e))
+        })?;
         Ok(Some(addr))
     } else {
-        Err(ProofGeneratorError::EncodingError(format!("Invalid address length: {}", header.payload_length)))
+        Err(ProofGeneratorError::EncodingError(format!(
+            "Invalid address length: {}",
+            header.payload_length
+        )))
     }
 }
 
 fn decode_access_list(buf: &mut &[u8]) -> Result<Vec<(Address, Vec<U256>)>, ProofGeneratorError> {
-    let header = alloy_rlp::Header::decode(buf)
-        .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode access list header: {}", e)))?;
-    
+    let header = alloy_rlp::Header::decode(buf).map_err(|e| {
+        ProofGeneratorError::EncodingError(format!("Failed to decode access list header: {}", e))
+    })?;
+
     if !header.list {
-        return Err(ProofGeneratorError::EncodingError("Expected list for access list".to_string()));
+        return Err(ProofGeneratorError::EncodingError(
+            "Expected list for access list".to_string(),
+        ));
     }
-    
+
     let mut access_list = Vec::new();
     let end_pos = buf.as_ptr() as usize + header.payload_length;
-    
+
     while (buf.as_ptr() as usize) < end_pos {
         // Decode access list entry: [address, [storageKey1, storageKey2, ...]]
-        let entry_header = alloy_rlp::Header::decode(buf)
-            .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode access list entry header: {}", e)))?;
-        
+        let entry_header = alloy_rlp::Header::decode(buf).map_err(|e| {
+            ProofGeneratorError::EncodingError(format!(
+                "Failed to decode access list entry header: {}",
+                e
+            ))
+        })?;
+
         if !entry_header.list {
-            return Err(ProofGeneratorError::EncodingError("Expected list for access list entry".to_string()));
+            return Err(ProofGeneratorError::EncodingError(
+                "Expected list for access list entry".to_string(),
+            ));
         }
-        
-        let address = Address::decode(buf)
-            .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode access list address: {}", e)))?;
-        
+
+        let address = Address::decode(buf).map_err(|e| {
+            ProofGeneratorError::EncodingError(format!(
+                "Failed to decode access list address: {}",
+                e
+            ))
+        })?;
+
         // Decode storage keys list
-        let keys_header = alloy_rlp::Header::decode(buf)
-            .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode storage keys header: {}", e)))?;
-        
+        let keys_header = alloy_rlp::Header::decode(buf).map_err(|e| {
+            ProofGeneratorError::EncodingError(format!(
+                "Failed to decode storage keys header: {}",
+                e
+            ))
+        })?;
+
         if !keys_header.list {
-            return Err(ProofGeneratorError::EncodingError("Expected list for storage keys".to_string()));
+            return Err(ProofGeneratorError::EncodingError(
+                "Expected list for storage keys".to_string(),
+            ));
         }
-        
+
         let mut storage_keys = Vec::new();
         let keys_end_pos = buf.as_ptr() as usize + keys_header.payload_length;
-        
+
         while (buf.as_ptr() as usize) < keys_end_pos {
-            let key = U256::decode(buf)
-                .map_err(|e| ProofGeneratorError::EncodingError(format!("Failed to decode storage key: {}", e)))?;
+            let key = U256::decode(buf).map_err(|e| {
+                ProofGeneratorError::EncodingError(format!("Failed to decode storage key: {}", e))
+            })?;
             storage_keys.push(key);
         }
-        
+
         access_list.push((address, storage_keys));
     }
-    
+
     Ok(access_list)
 }
 
@@ -999,7 +1114,7 @@ fn decode_access_list(buf: &mut &[u8]) -> Result<Vec<(Address, Vec<U256>)>, Proo
 // ) -> Result<DecodedTransaction, ProofGeneratorError> {
 //     // First verify the proof and get the encoded transaction
 //     // let encoded_tx = verify_trie_proof(root, tx_index, proof)?;
-    
+
 //     // Then decode the transaction
 //     // decode_bsc_transaction(&encoded_tx)
 // }
@@ -1062,7 +1177,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
     println!("k {:?}", k);
     let k = decode_bsc_transaction(&k.unwrap()).unwrap();
-    println!("decode txn {:?}",k);
+    println!("decode txn {:?}", k);
 
     Ok(())
 }
