@@ -74,6 +74,10 @@ async fn get_block_by_number(block_number: &str) -> Result<Value, Box<dyn Error>
         .await?;
 
     let block_data: Value = response.json().await?;
+
+    let file_name = format!("block_{}.json", block_number);
+    std::fs::write(&file_name, serde_json::to_string_pretty(&block_data)?)?;
+    
     Ok(block_data)
 }
 
@@ -757,16 +761,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Roots match: {}", constructed_root_b256 == expected_root);
 
     if constructed_root_b256 == expected_root {
-        let proof = trie.get_proof(&encode(0_u8)).unwrap();
+        let proof = trie.get_proof(&encode(123_u8)).unwrap();
         println!("Proof generated successfully with {} nodes", proof.len());
 
         let verified_value = trie
-            .verify_proof(constructed_root, &encode(0_u8), proof)
+            .verify_proof(constructed_root, &encode(123_u8), proof)
             .unwrap();
+
+        println!("verified value {:?}",verified_value);
 
         if let Some(value) = verified_value {
             let decoded_tx = decode_bsc_transaction(&value).unwrap();
-            println!("Successfully decoded transaction: {:?}", decoded_tx.tx_type);
+            println!("Successfully decoded transaction: {:?}", decoded_tx);
         }
     }
 
